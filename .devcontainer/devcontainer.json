@@ -1,0 +1,21 @@
+{
+  "name": "samod",
+  "build": {
+    "dockerfile": "Dockerfile"
+  },
+  "remoteUser": "vscode",
+  // Debuggers (gdb, lldb), tracers (strace, ltrace) and profilers (perf,
+  // samply) need ptrace and perf_event_open, which the default container
+  // seccomp profile and capability set block.
+  //
+  // perf and samply are additionally subject to the host's
+  // kernel.perf_event_paranoid sysctl, which cannot be changed from inside an
+  // unprivileged container. If profiling fails with a permission error, run
+  // `sudo sysctl kernel.perf_event_paranoid=1` on the host.
+  "capAdd": ["SYS_PTRACE", "PERFMON"],
+  "securityOpt": ["seccomp=unconfined"],
+  "init": true,
+  "containerEnv": {
+    "RUST_BACKTRACE": "1"
+  }
+}
