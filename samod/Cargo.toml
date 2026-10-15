@@ -47,6 +47,8 @@ reqwest = { version = "0.12.22", features = [
 tempfile = "3.20.0"
 tokio = { version = "1.46.0", features = [
     "rt",
+    "rt-multi-thread",
+    "net",
     "time",
     "macros",
     "process",
@@ -60,6 +62,10 @@ tracing-subscriber = { version = "0.3.19", features = ["env-filter"] }
 [[test]]
 name = "js_interop"
 required-features = ["tokio", "tungstenite", "axum"]
+
+[[test]]
+name = "stress"
+required-features = ["tokio", "threadpool"]
 
 
 [package.metadata.docs.rs]
