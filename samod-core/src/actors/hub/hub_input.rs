@@ -1,5 +1,5 @@
 use crate::{
-    ConnectionId, DialerId, DocumentActorId, ListenerId,
+    ConnectionId, DialerId, DocumentActorId, ListenerId, PeerId,
     actors::{
         hub::{Command, CommandId},
         messages::DocToHubMsgPayload,
@@ -37,16 +37,20 @@ pub(crate) enum HubInput {
     CreateDialerConnection {
         command_id: CommandId,
         dialer_id: DialerId,
+        expected_peer_id: Option<PeerId>,
     },
     /// Create a connection for a listener (IO layer accepted an inbound transport)
     CreateListenerConnection {
         command_id: CommandId,
         listener_id: ListenerId,
+        expected_peer_id: Option<PeerId>,
     },
     /// The IO layer failed to establish a transport for a dialer
     DialFailed {
         dialer_id: DialerId,
         error: String,
+        /// Whether retrying can never succeed.
+        permanent: bool,
     },
     /// Remove a dialer and close its connection
     RemoveDialer {

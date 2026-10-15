@@ -7,6 +7,8 @@ use crate::Repo;
 use crate::connection::ConnectionHandle;
 
 #[cfg(feature = "tungstenite")]
+use std::convert::Infallible;
+#[cfg(feature = "tungstenite")]
 use std::pin::Pin;
 #[cfg(feature = "tungstenite")]
 use std::sync::Arc;
@@ -166,6 +168,8 @@ impl TungsteniteDialer {
 
 #[cfg(feature = "tungstenite")]
 impl crate::Dialer for TungsteniteDialer {
+    type Error = Infallible;
+
     fn url(&self) -> Url {
         self.url.clone()
     }
@@ -175,16 +179,15 @@ impl crate::Dialer for TungsteniteDialer {
     ) -> Pin<
         Box<
             dyn std::future::Future<
-                    Output = Result<
-                        crate::Transport,
-                        Box<dyn std::error::Error + Send + Sync + 'static>,
-                    >,
+                    Output = Result<crate::Transport, crate::DialError<Self::Error>>,
                 > + Send,
         >,
     > {
         let url = self.url.clone();
         Box::pin(async move {
-            let (ws, _response) = tokio_tungstenite::connect_async(url.as_str()).await?;
+            let (ws, _response) = tokio_tungstenite::connect_async(url.as_str())
+                .await
+                .map_err(crate::DialError::transient)?;
 
             // Wrap tungstenite errors into NetworkError
             let ws = ws
@@ -224,9 +227,27 @@ impl Repo {
         &self,
         url: Url,
         backoff: crate::BackoffConfig,
-    ) -> Result<crate::DialerHandle, crate::Stopped> {
+    ) -> Result<crate::DialerHandle<Infallible>, crate::Stopped> {
         let dialer = Arc::new(TungsteniteDialer::new(url));
         self.dial(backoff, dialer)
+    }
+}
+
+#[cfg(feature = "axum")]
+impl crate::Transport {
+    /// Create a transport from an axum WebSocket after the HTTP upgrade.
+    ///
+    /// Converts binary WebSocket messages to and from samod protocol messages.
+    /// Use [`Transport::with_expected_peer_id`](crate::Transport::with_expected_peer_id)
+    /// to bind the transport to an externally authenticated peer identity before
+    /// passing it to [`AcceptorHandle::accept`](crate::AcceptorHandle::accept).
+    /// Without an expectation, the peer's claimed handshake identity is trusted.
+    pub fn from_axum(socket: axum::extract::ws::WebSocket) -> Self {
+        let ws = socket
+            .map_err(|e| NetworkError(format!("error receiving websocket message: {}", e)))
+            .sink_map_err(|e| NetworkError(format!("error sending websocket message: {}", e)));
+        let (msg_stream, msg_sink) = ws_to_bytes::<_, axum::extract::ws::Message>(ws);
+        Self::new(msg_stream, msg_sink)
     }
 }
 
@@ -259,21 +280,25 @@ impl crate::AcceptorHandle {
 
     /// Accept an axum WebSocket connection.
     ///
-    /// This is a convenience wrapper around [`AcceptorHandle::accept`] that
-    /// handles the conversion between axum's `Message` type and raw bytes.
+    /// This is a convenience wrapper around [`Transport::from_axum`](crate::Transport::from_axum)
+    /// and [`AcceptorHandle::accept`](crate::AcceptorHandle::accept).
     ///
     /// # Arguments
     ///
     /// * `socket` - An axum WebSocket (both `Sink` and `Stream`).
+    /// * `expected_peer_id` - The externally authenticated peer ID, if any. If
+    ///   this is not passed then we will trust whatever peer ID the remote
+    ///   claims in their handshake.
     #[cfg(feature = "axum")]
     pub fn accept_axum(
         &self,
         socket: axum::extract::ws::WebSocket,
+        expected_peer_id: Option<crate::PeerId>,
     ) -> Result<ConnectionHandle, crate::Stopped> {
-        let ws = socket
-            .map_err(|e| NetworkError(format!("error receiving websocket message: {}", e)))
-            .sink_map_err(|e| NetworkError(format!("error sending websocket message: {}", e)));
-        let (msg_stream, msg_sink) = ws_to_bytes::<_, axum::extract::ws::Message>(ws);
-        self.accept(crate::Transport::new(msg_stream, msg_sink))
+        let mut transport = crate::Transport::from_axum(socket);
+        if let Some(peer_id) = expected_peer_id {
+            transport = transport.with_expected_peer_id(peer_id);
+        }
+        self.accept(transport)
     }
 }

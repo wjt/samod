@@ -1,5 +1,5 @@
 #![allow(dead_code)]
-use std::{pin::Pin, sync::Arc};
+use std::{convert::Infallible, pin::Pin, sync::Arc};
 
 use futures::{FutureExt, Sink, SinkExt, Stream, StreamExt, select};
 use rand::Rng;
@@ -96,6 +96,8 @@ struct CancellableDialer {
 }
 
 impl Dialer for CancellableDialer {
+    type Error = Infallible;
+
     fn url(&self) -> Url {
         self.url.clone()
     }
@@ -104,9 +106,8 @@ impl Dialer for CancellableDialer {
         &self,
     ) -> Pin<
         Box<
-            dyn std::future::Future<
-                    Output = Result<Transport, Box<dyn std::error::Error + Send + Sync + 'static>>,
-                > + Send,
+            dyn std::future::Future<Output = Result<Transport, samod::DialError<Self::Error>>>
+                + Send,
         >,
     > {
         let (dialer_side, acceptor_side) = mem_transport_pair_with_cancel(self.cancel.clone());
@@ -115,7 +116,7 @@ impl Dialer for CancellableDialer {
         Box::pin(async move {
             acceptor
                 .accept(Transport::new(acceptor_side.recv, acceptor_side.send))
-                .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync + 'static>)?;
+                .map_err(samod::DialError::transient)?;
 
             Ok(Transport::new(dialer_side.recv, dialer_side.send))
         })

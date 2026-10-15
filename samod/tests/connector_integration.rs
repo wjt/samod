@@ -1,6 +1,7 @@
 #![cfg(feature = "tokio")]
 
 use std::{
+    convert::Infallible,
     pin::Pin,
     sync::{
         Arc,
@@ -92,6 +93,8 @@ impl MockDialer {
 }
 
 impl Dialer for MockDialer {
+    type Error = Infallible;
+
     fn url(&self) -> Url {
         self.url.clone()
     }
@@ -100,9 +103,8 @@ impl Dialer for MockDialer {
         &self,
     ) -> Pin<
         Box<
-            dyn std::future::Future<
-                    Output = Result<Transport, Box<dyn std::error::Error + Send + Sync + 'static>>,
-                > + Send,
+            dyn std::future::Future<Output = Result<Transport, samod::DialError<Self::Error>>>
+                + Send,
         >,
     > {
         self.connect_count.fetch_add(1, Ordering::SeqCst);
@@ -114,7 +116,7 @@ impl Dialer for MockDialer {
             // Feed the acceptor side to the acceptor handle
             acceptor
                 .accept(Transport::new(acceptor_side.recv, acceptor_side.send))
-                .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync + 'static>)?;
+                .map_err(samod::DialError::transient)?;
 
             Ok(Transport::new(dialer_side.recv, dialer_side.send))
         })
@@ -137,6 +139,8 @@ impl FailingDialer {
 }
 
 impl Dialer for FailingDialer {
+    type Error = Infallible;
+
     fn url(&self) -> Url {
         self.url.clone()
     }
@@ -145,13 +149,45 @@ impl Dialer for FailingDialer {
         &self,
     ) -> Pin<
         Box<
-            dyn std::future::Future<
-                    Output = Result<Transport, Box<dyn std::error::Error + Send + Sync + 'static>>,
-                > + Send,
+            dyn std::future::Future<Output = Result<Transport, samod::DialError<Self::Error>>>
+                + Send,
         >,
     > {
         self.fail_count.fetch_add(1, Ordering::SeqCst);
-        Box::pin(async { Err("connection refused".into()) })
+        Box::pin(async {
+            Err(samod::DialError::TransientFailure(
+                "connection refused".into(),
+            ))
+        })
+    }
+}
+
+struct AuthenticationFailingDialer {
+    url: Url,
+    attempts: Arc<AtomicUsize>,
+}
+
+impl Dialer for AuthenticationFailingDialer {
+    type Error = MemError;
+
+    fn url(&self) -> Url {
+        self.url.clone()
+    }
+
+    fn connect(
+        &self,
+    ) -> Pin<
+        Box<
+            dyn std::future::Future<Output = Result<Transport, samod::DialError<Self::Error>>>
+                + Send,
+        >,
+    > {
+        self.attempts.fetch_add(1, Ordering::SeqCst);
+        Box::pin(async {
+            Err(samod::DialError::PermanentFailure(MemError(
+                "authentication failed".to_string(),
+            )))
+        })
     }
 }
 
@@ -175,6 +211,8 @@ impl FailThenSucceedDialer {
 }
 
 impl Dialer for FailThenSucceedDialer {
+    type Error = Infallible;
+
     fn url(&self) -> Url {
         self.url.clone()
     }
@@ -183,23 +221,24 @@ impl Dialer for FailThenSucceedDialer {
         &self,
     ) -> Pin<
         Box<
-            dyn std::future::Future<
-                    Output = Result<Transport, Box<dyn std::error::Error + Send + Sync + 'static>>,
-                > + Send,
+            dyn std::future::Future<Output = Result<Transport, samod::DialError<Self::Error>>>
+                + Send,
         >,
     > {
         let attempt = self.attempt.fetch_add(1, Ordering::SeqCst);
         if attempt < self.fail_times {
-            Box::pin(async move { Err(format!("connection refused (attempt {attempt})").into()) })
+            Box::pin(async move {
+                Err(samod::DialError::TransientFailure(
+                    format!("connection refused (attempt {attempt})").into(),
+                ))
+            })
         } else {
             let (dialer_side, acceptor_side) = mem_transport_pair();
             let acceptor = self.acceptor.clone();
             Box::pin(async move {
                 acceptor
                     .accept(Transport::new(acceptor_side.recv, acceptor_side.send))
-                    .map_err(|e| {
-                        Box::new(e) as Box<dyn std::error::Error + Send + Sync + 'static>
-                    })?;
+                    .map_err(samod::DialError::transient)?;
                 Ok(Transport::new(dialer_side.recv, dialer_side.send))
             })
         }
@@ -712,6 +751,48 @@ async fn dial_max_retries_emits_failure() {
 
     assert!(result.is_err());
     assert!(!handle.is_connected());
+
+    alice.stop().await;
+}
+
+#[tokio::test]
+async fn permanent_dial_failure_returns_typed_error_without_retrying() {
+    init_logging();
+    let alice = Repo::build_tokio()
+        .with_peer_id(PeerId::from("alice"))
+        .load()
+        .await;
+
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let dialer = AuthenticationFailingDialer {
+        url: Url::parse("wss://localhost:9999").unwrap(),
+        attempts: attempts.clone(),
+    };
+    let handle = alice
+        .dial(
+            BackoffConfig {
+                initial_delay: Duration::from_millis(1),
+                max_delay: Duration::from_millis(1),
+                max_retries: None,
+            },
+            Arc::new(dialer),
+        )
+        .unwrap();
+
+    let (first, second) = futures::join!(handle.established(), handle.established());
+    let first_error = match first.unwrap_err() {
+        samod::DialerFailed::PermanentFailure(error) => error,
+        other => panic!("expected permanent failure, got {other:?}"),
+    };
+    let second_error = match second.unwrap_err() {
+        samod::DialerFailed::PermanentFailure(error) => error,
+        other => panic!("expected permanent failure, got {other:?}"),
+    };
+
+    assert_eq!(first_error.0, "authentication failed");
+    assert!(Arc::ptr_eq(&first_error, &second_error));
+    tokio::time::sleep(Duration::from_millis(25)).await;
+    assert_eq!(attempts.load(Ordering::SeqCst), 1);
 
     alice.stop().await;
 }

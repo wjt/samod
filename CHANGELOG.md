@@ -1,5 +1,63 @@
 # Changelog
 
+## Unreleased
+
+### Breaking Changes
+
+* `samod_core::network::ConnectionInfo::docs` is now an
+  `Arc<HashMap<DocumentId, PeerDocState>>`, so that connection info snapshots
+  are cheap to produce. `samod::ConnectionInfo` is unchanged.
+
+## 0.15.0 - 2026-09-30
+
+### Breaking Changes
+
+* `AcceptorHandle::accept_axum` now takes an `expected_peer_id: Option<PeerId>`.
+  Pass `None` to preserve the previous behavior.
+
+### Added
+
+* `Transport::with_expected_peer_id` binds a transport to an externally
+  authenticated peer ID, rejecting mismatched handshakes before synchronization.
+* `Transport::from_axum` converts an upgraded axum WebSocket into a transport
+  that can be configured before accepting it.
+
+### Fixed
+
+* Reject direct messages whose sender differs from the handshake identity,
+  and messages addressed to another peer.
+* Protocol rejection now closes the transport and updates connection/retry state.
+* Connections closed before handshaking resolve handshake waiters, and rejected
+  inbound handshakes no longer decrement the count of healthy connections.
+
+## 0.14.0 - 2026-09-17
+
+### Breaking Changes
+
+* Updated to `automerge@0.12.0`.
+* `Dialer` now has an associated `Error` type, and `Dialer::connect` returns
+  `DialError<Self::Error>` to distinguish transient and permanent failures.
+* `DialerHandle` and `DialerFailed` are now generic over the dialer's error
+  type. `DialerFailed` is now an enum distinguishing exhausted retries from a
+  user-defined permanent failure.
+* Added `DialerEvent::PermanentFailure`
+
+### Added
+
+* `Dialer::connect` can return a `DialError::PermanentFailure` to indicate
+  that samod should not retry connection. This error is returned to listeners
+  on `DialerHandle::established`
+
+## 0.13.0 - 2026-08-12
+
+### Fixed
+
+* FileSystemStorage now limits the number of file descriptors it opens to 500
+
+### Breaking Changes
+
+* Updated to `automerge@0.11.0`
+
 ## 0.12.3 - 2026-07-09
 
 ### Fixed

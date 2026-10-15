@@ -9,9 +9,9 @@ use super::DialerId;
 /// The IO layer should:
 ///
 /// 1. Attempt to establish a transport to the given URL.
-/// 2. On success: call `HubEvent::create_dialer_connection(dialer_id)` to get
+/// 2. On success: call `HubEvent::create_dialer_connection(dialer_id, expected_peer_id)` to get
 ///    a `ConnectionId`, wire up the stream/sink, then start driving the connection.
-/// 3. On failure: call `HubEvent::dial_failed(dialer_id, error)`.
+/// 3. On failure: call `HubEvent::dial_failed(dialer_id, error, permanent)`.
 #[derive(Debug, Clone)]
 pub struct DialRequest {
     /// The dialer that needs a transport.

@@ -63,6 +63,12 @@ pub(crate) struct State {
     listeners: HashMap<ListenerId, ListenerState>,
 
     searches: Searches,
+
+    /// Connections which have completed their handshake but have not yet been
+    /// subscribed to existing documents. Documents spawned after a connection
+    /// is established are subscribed in `spawn_actor`, so this is the only
+    /// source of missing subscriptions.
+    newly_established: Vec<ConnectionId>,
 }
 
 impl State {
@@ -83,6 +89,7 @@ impl State {
             dialers: HashMap::new(),
             listeners: HashMap::new(),
             searches: Searches::new(),
+            newly_established: Vec::new(),
         }
     }
 
@@ -155,6 +162,7 @@ impl State {
                 format!("Listener {:?} connection removed", listener_id)
             }
         };
+        let msg = conn.closed_reason().map(str::to_owned).unwrap_or(msg);
         results.emit_disconnect_event(*connection_id, conn.owner(), msg);
         results.emit_io_action(HubIoAction::Disconnect {
             connection_id: *connection_id,
@@ -194,7 +202,7 @@ impl State {
                             },
                         )
                     } else {
-                        (HashMap::new(), ConnectionState::Handshaking)
+                        (Default::default(), ConnectionState::Handshaking)
                     };
                 ConnectionInfo {
                     id: *conn_id,
@@ -252,6 +260,7 @@ impl State {
         let handle = ActorInfo::new_with_id(actor_id, document_id.clone());
         self.actors.insert(actor_id, handle);
         self.document_to_actor.insert(document_id, actor_id);
+        self.searches.mark_dirty(actor_id);
     }
 
     pub(crate) fn find_actor_for_document(&self, document_id: &DocumentId) -> Option<&ActorInfo> {
@@ -285,38 +294,35 @@ impl State {
         };
         actor_info.search_phase = new_phase.clone();
         let doc_id = actor_info.document_id.clone();
+        self.searches.mark_dirty(actor_id);
         if new_phase == DocSearchPhase::Ready {
             self.pending_commands
                 .resolve_pending_create(actor_id, &doc_id);
         }
     }
 
+    /// Subscribe newly established connections to every existing document.
+    ///
+    /// This only visits connections queued in `newly_established`, rather than
+    /// rescanning every connection against every document, which would make
+    /// each hub event cost O(connections * documents).
     pub(crate) fn ensure_connections(&mut self) -> Vec<(DocumentActorId, ConnectionId, PeerId)> {
-        let mut to_connect = Vec::new();
-        for (conn_id, conn) in &mut self.connections {
-            if let Some(established) = conn.established_connection_mut() {
-                for (doc_id, doc_actor) in &self.document_to_actor {
-                    if !established.document_subscriptions().contains_key(doc_id) {
-                        to_connect.push((
-                            established.remote_peer_id().clone(),
-                            *conn_id,
-                            doc_id.clone(),
-                            doc_actor,
-                        ));
-                        established.add_document_subscription(doc_id.clone());
-                    }
+        let mut result = Vec::new();
+        for conn_id in std::mem::take(&mut self.newly_established) {
+            let Some(established) = self
+                .connections
+                .get_mut(&conn_id)
+                .and_then(|c| c.established_connection_mut())
+            else {
+                continue;
+            };
+            for (doc_id, doc_actor) in &self.document_to_actor {
+                if !established.document_subscriptions().contains_key(doc_id) {
+                    established.add_document_subscription(doc_id.clone());
+                    result.push((*doc_actor, conn_id, established.remote_peer_id().clone()));
                 }
             }
         }
-
-        let mut result = Vec::new();
-
-        for (peer_id, conn_id, doc_id, actor) in to_connect {
-            let conn = self.connections.get_mut(&conn_id).unwrap();
-            conn.add_document(doc_id);
-            result.push((*actor, conn_id, peer_id));
-        }
-
         result
     }
 
@@ -343,18 +349,11 @@ impl State {
         }
     }
 
-    pub(crate) fn pop_closed_connections(&mut self) -> Vec<ConnectionId> {
-        let closed: Vec<_> = self
-            .connections
+    fn closed_connections(&self) -> Vec<ConnectionId> {
+        self.connections
             .iter()
             .filter_map(|(id, conn)| if conn.is_closed() { Some(*id) } else { None })
-            .collect();
-
-        for id in &closed {
-            self.connections.remove(id);
-        }
-
-        closed
+            .collect()
     }
 
     pub(crate) fn pop_new_connection_info(&mut self) -> HashMap<ConnectionId, ConnectionInfo> {
@@ -469,6 +468,7 @@ impl State {
                         DocToHubMsgPayload::Terminated => {
                             tracing::debug!(?actor_id, "document actor terminated");
                             self.actors.remove(&actor_id);
+                            self.searches.remove(&actor_id);
                         }
                     },
                     HubInput::ConnectionLost { connection_id } => {
@@ -485,20 +485,35 @@ impl State {
                     HubInput::CreateDialerConnection {
                         command_id,
                         dialer_id,
+                        expected_peer_id,
                     } => {
-                        let result = self.handle_create_dialer_connection(now, results, dialer_id);
+                        let result = self.handle_create_dialer_connection(
+                            now,
+                            results,
+                            dialer_id,
+                            expected_peer_id,
+                        );
                         results.completed_commands.insert(command_id, result);
                     }
                     HubInput::CreateListenerConnection {
                         command_id,
                         listener_id,
+                        expected_peer_id,
                     } => {
-                        let result =
-                            self.handle_create_listener_connection(now, results, listener_id);
+                        let result = self.handle_create_listener_connection(
+                            now,
+                            results,
+                            listener_id,
+                            expected_peer_id,
+                        );
                         results.completed_commands.insert(command_id, result);
                     }
-                    HubInput::DialFailed { dialer_id, error } => {
-                        self.handle_dial_failed(rng, now, results, dialer_id, &error);
+                    HubInput::DialFailed {
+                        dialer_id,
+                        error,
+                        permanent,
+                    } => {
+                        self.handle_dial_failed(rng, now, results, dialer_id, &error, permanent);
                     }
                     HubInput::RemoveDialer { dialer_id } => {
                         self.handle_remove_dialer(results, dialer_id);
@@ -510,16 +525,10 @@ impl State {
             }
         }
 
-        // Notify document actors of any closed connections
-        for conn_id in self.pop_closed_connections() {
-            for doc in self.document_actors() {
-                results.send_to_doc_actor(
-                    doc.actor_id,
-                    HubToDocMsgPayload::ConnectionClosed {
-                        connection_id: conn_id,
-                    },
-                );
-            }
+        // Protocol rejection must tear down the transport as well as document
+        // state, and update the owning listener or dialer's retry state.
+        for conn_id in self.closed_connections() {
+            self.handle_connection_lost(rng, now, results, conn_id);
         }
 
         // Now ensure that every connection is connected to every document
@@ -629,11 +638,7 @@ impl State {
                     "failed to decode message: {}",
                     e
                 );
-                let error_msg = format!("Message decode error: {e}");
-                if let Some(conn) = self.connections.get(&connection_id) {
-                    tracing::debug!(error=?error_msg, remote_peer_id=?conn.remote_peer_id(), "failing connection");
-                    self.remove_connection(out, &connection_id);
-                }
+                conn.close(format!("Message decode error: {e}"));
 
                 return CommandResult::Receive {
                     connection_id,
@@ -646,6 +651,7 @@ impl State {
             match evt {
                 ReceiveEvent::HandshakeComplete { remote_peer_id } => {
                     tracing::debug!(?connection_id, ?remote_peer_id, "handshake completed");
+                    self.newly_established.push(connection_id);
                     // Reset backoff on successful handshake
                     self.reset_dialer_backoff_for_connection(connection_id);
                     // Emit handshake completed event
@@ -726,6 +732,7 @@ impl State {
         // Validate this request is for us
         if target_id != self.peer_id {
             tracing::trace!(?connection_id, ?msg, "ignoring message for another peer");
+            return;
         }
 
         // Ensure there's a document actor for this document
@@ -1053,6 +1060,7 @@ impl State {
         now: UnixTimestamp,
         out: &mut HubResults,
         dialer_id: DialerId,
+        expected_peer_id: Option<PeerId>,
     ) -> CommandResult {
         let dialer_exists = self.dialers.contains_key(&dialer_id);
         if !dialer_exists {
@@ -1065,6 +1073,7 @@ impl State {
             out,
             ConnectionArgs {
                 direction: ConnDirection::Outgoing,
+                expected_peer_id,
                 owner,
                 local_peer_id: self.peer_id.clone(),
                 local_metadata: Some(local_metadata),
@@ -1101,6 +1110,7 @@ impl State {
         now: UnixTimestamp,
         out: &mut HubResults,
         listener_id: ListenerId,
+        expected_peer_id: Option<PeerId>,
     ) -> CommandResult {
         let listener_exists = self.listeners.contains_key(&listener_id);
         if !listener_exists {
@@ -1116,6 +1126,7 @@ impl State {
             out,
             ConnectionArgs {
                 direction: ConnDirection::Incoming,
+                expected_peer_id,
                 owner,
                 local_peer_id: self.peer_id.clone(),
                 local_metadata: Some(local_metadata),
@@ -1147,17 +1158,31 @@ impl State {
         results: &mut HubResults,
         dialer_id: DialerId,
         error: &str,
+        permanent: bool,
     ) {
         let Some(dialer) = self.dialers.get_mut(&dialer_id) else {
             tracing::warn!(
                 ?dialer_id,
                 %error,
+                permanent,
                 "dial_failed for unknown dialer"
             );
             return;
         };
 
         let url = dialer.url.clone();
+        if permanent {
+            if dialer.handle_permanent_dial_failure() {
+                tracing::warn!(
+                    ?dialer_id,
+                    %url,
+                    %error,
+                    "dialer permanently failed"
+                );
+            }
+            return;
+        }
+
         tracing::warn!(
             ?dialer_id,
             %url,

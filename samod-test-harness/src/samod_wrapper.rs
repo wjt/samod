@@ -150,7 +150,8 @@ impl SamodWrapper {
 
     /// Create a connection for a specific dialer.
     pub fn create_dialer_connection(&mut self, dialer_id: DialerId) -> samod_core::ConnectionId {
-        let DispatchedCommand { command_id, event } = HubEvent::create_dialer_connection(dialer_id);
+        let DispatchedCommand { command_id, event } =
+            HubEvent::create_dialer_connection(dialer_id, None);
         self.inbox.push_back(event);
         self.handle_events();
         let completed_command = self
@@ -185,7 +186,7 @@ impl SamodWrapper {
         listener_id: ListenerId,
     ) -> samod_core::ConnectionId {
         let DispatchedCommand { command_id, event } =
-            HubEvent::create_listener_connection(listener_id);
+            HubEvent::create_listener_connection(listener_id, None);
         self.inbox.push_back(event);
         self.handle_events();
         let completed_command = self
@@ -393,7 +394,7 @@ impl SamodWrapper {
     /// Notify the hub that a dial attempt failed for a dialer.
     pub fn dial_failed(&mut self, dialer_id: DialerId, error: String) {
         self.inbox
-            .push_back(HubEvent::dial_failed(dialer_id, error));
+            .push_back(HubEvent::dial_failed(dialer_id, error, false));
         self.handle_events();
     }
 
